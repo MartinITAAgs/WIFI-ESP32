@@ -1,0 +1,314 @@
+Librerias para el funcionamiento del codigo
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_PN532.h>
+#include <Arduino.h>
+
+Variables para la conexión de la red y las rutas que buscara en el servidor API
+const char* ssid = "TP-Link_3262";
+const char* password = "99428167";
+const char* testUrl = "http://192.168.0.104:3000/api/test";
+const char* insertUrl = "http://192.168.0.104:3000/api/puntuaciones";
+
+
+Pines para que funcione el NFC en I2C
+#define SDA_PIN 21
+#define SCL_PIN 22
+Adafruit_PN532 nfc(-1, -1);
+
+Variables para el estado del sistema y el funcionamiento del juego
+bool sistemaListo = false;
+int valores[7];
+int ordenados[7];
+bool abiertos[7];
+int maletinPersonal;
+int puntaje;
+int oferta;
+char usuario[50];
+String uidStr = "";
+
+bool juegoActivo = false;
+static int etapa = 0;
+static int descartados = 0;
+
+Funciones del led integrado
+#define LED_PIN 2
+void setupLED() {
+  pinMode(LED_PIN, OUTPUT);
+}
+
+Funcion que conecta a la red wifi con la contraseña y red definidas arriba. Tiene 20 intentos de conectarse si no lo consigue avisa de un error de conexion
+void connectWiFi() {
+  Serial.println("Conectando WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED && attempt < 20) {
+    delay(500);
+    Serial.print(".");
+    attempt++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi OK");
+  } else {
+    Serial.println("\nWiFi FAIL");
+  }
+}
+
+Funcion que permite iniciar el juego una vez estando listo los sistemas de red, nfc y la conexión de base de datos
+void iniciarJuego() {
+
+  randomSeed(esp_random());
+
+  for (int i = 0; i < 7; i++) {
+    valores[i] = esp_random() % 1000 + 1;
+    ordenados[i] = valores[i];
+    abiertos[i] = false;
+  }
+
+  for (int i = 0; i < 6; i++) {
+    for (int j = 0; j < 6 - i; j++) {
+      if (ordenados[j] > ordenados[j + 1]) {
+        int temp = ordenados[j];
+        ordenados[j] = ordenados[j + 1];
+        ordenados[j + 1] = temp;
+      }
+    }
+  }
+
+  Serial.println("\n=== DEAL OR NO DEAL ===");
+  Serial.println("Valores:");
+  for (int i = 0; i < 7; i++) {
+    Serial.print(ordenados[i]);
+    Serial.print(" ");
+  }
+
+  Serial.println("\nElige maletín (0-6)");
+
+  etapa = 0;
+  descartados = 0;
+  juegoActivo = true;
+}
+
+Metodo que recibirá los valores que se insertaran en la base de datos de servidor.
+bool insertDataToDatabase(const char* name_disp, const char* usr, int score, const char* id_rfid) {
+  Serial.println("\nEnviando INSERT a MSSQL...");
+  
+Se crea un cliente HTTP y se especifica que ruta api se usara. Ademas se especifica que trabajara con objetos Json
+  HTTPClient http;
+  http.begin(insertUrl);
+  http.addHeader("Content-Type", "application/json");
+  
+Se crea el objeto Json con los atributos que se enviaran al insert
+  DynamicJsonDocument doc(200);
+  doc["name_disp"] = name_disp;
+  doc["usr"] = usr;
+  doc["score"] = score;
+  doc["id_rfid"] = id_rfid;
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  Si los datos fueron enviados, se notifica, si hay algún error da el código de error	
+  Serial.print("Datos enviados: ");
+  Serial.println(jsonString);
+  
+  int httpCode = http.POST(jsonString);
+  
+  if (httpCode == 200) {
+    String response = http.getString();
+    Serial.println("✓ INSERT exitoso");
+    Serial.println(response);
+    http.end();
+    return true;
+  } else {
+    Serial.print("✗ Error en INSERT: ");
+    Serial.println(httpCode);
+    String response = http.getString();
+    Serial.println(response);
+    http.end();
+    return false;
+  }
+}
+
+void setup() {
+Comunicacion serial
+  Serial.begin(115200);
+
+
+Activa el I2C usando los pines definidos
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+Inicia la function del LED integrado
+  setupLED();
+
+Inicia la conexión wifi con el método connectWIFI
+  connectWiFi();
+
+Inicia la conexion con la base de datos, el estado de la conexión se hace saber mediante la consola serial
+  if (WiFi.status() == WL_CONNECTED) {
+  sistemaListo = true;
+  Serial.println("Sistema listo ✔");
+} else {
+  Serial.println("Sistema NO listo ❌");
+  while (1) delay(1000);
+}
+
+Habilita la funcionalidad NFC y lo configura para leer tags nfc
+  nfc.begin();
+
+  if (!nfc.getFirmwareVersion()) {
+    Serial.println("PN532 no detectado");
+    while (1);
+  }
+
+  nfc.SAMConfig();
+
+  Serial.println("Acerca NFC para iniciar...");
+}
+
+void loop() {
+
+  condicoinal para revisar que el sistema este funcionando antes de iniciar el juego
+  if (!sistemaListo) return;
+
+  Mientras el juego no este activo, espera un tag nfc, 
+  if (!juegoActivo) {
+
+    uint8_t uid[7];
+    uint8_t uidLength;
+    uidStr = "";
+
+Cuando detecte un tag nfc, guarda los datos del UID del tag en un array 
+    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
+      Serial.println("NFC detectado -> iniciando juego");
+      for (uint8_t i = 0; i < uidLength; i++) {
+        if (uid[i] < 0x10) uidStr += "0";   
+        uidStr += String(uid[i], HEX;
+      }
+      Se solicita un nombre de jugador
+     Serial.println("Escribe tu nombre de jugador:");
+     while (Serial.available() == 0) {
+       
+     }
+     String nombre = Serial.readStringUntil('\n');
+     nombre.trim();
+
+      guarda el nombre en un array llamado usuario y le da la bienvenida
+      nombre.toCharArray(usuario, nombre.length() + 1);
+
+      Serial.print("Bienvenido, ");
+      Serial.println(nombre);
+      iniciarJuego();
+    }
+
+    return;
+  }
+Funcionalidad del juego DEAL or no DEAL, en cada final del juego se llama la función para mandar los datos a la base de datos
+  if (Serial.available() > 0) {
+    String entrada = Serial.readStringUntil('\n');
+    entrada.trim();
+    if (entrada.length() == 0) return;
+
+    int opcion = entrada.toInt();
+
+    if (etapa == 0) {
+      if (opcion >= 0 && opcion < 7) {
+        maletinPersonal = opcion;
+        abiertos[maletinPersonal] = true;
+        Serial.print("Has elegido el maletín ");
+        Serial.println(maletinPersonal);
+        etapa = 1;
+        Serial.println("Descarta 3 maletines (0-6):");
+      }
+    } else if (etapa == 1) {
+      if (opcion >= 0 && opcion < 7 && !abiertos[opcion]) {
+        abiertos[opcion] = true;
+        Serial.print("Maletín ");
+        Serial.print(opcion);
+        Serial.print(" abierto: $");
+        Serial.println(valores[opcion]);
+        descartados++;
+      }
+      if (descartados == 3) {
+        int suma = 0, cuenta = 0;
+        for (int i = 0; i < 7; i++) if (!abiertos[i]) { suma += valores[i]; cuenta++; }
+        oferta = (suma / cuenta) * 0.7;
+        Serial.print("Oferta del banco: $");
+        Serial.println(oferta);
+        Serial.println("¿Deal (1) o No Deal (0)?");
+        etapa = 2;
+      }
+    } else if (etapa == 2) {
+      if (opcion == 1) {
+        Serial.println("¡Aceptaste la oferta! Fin del juego.");
+        puntaje = oferta;
+        Serial.print("Tu puntaje es: ");
+        Serial.println(puntaje);
+Manda los datos a la función para insertar a la base de datos con el nombre del juego, el nombre del jugador, puntaje y el UID del tag NFC y reinicia el esp
+        if (insertDataToDatabase("DEAL OR NOT DEAL", usuario, puntaje, uidStr.c_str())) {
+    Serial.println("\n✓✓✓ Puntaje subido a la base de datos✓✓✓");
+  } else {
+    Serial.println("\n✗✗✗ ERROR EN INSERT ✗✗✗");
+  }
+  delay(5000);
+        ESP.restart();
+      } else {
+        Serial.println("No Deal. Descarta 2 maletines más:");
+        descartados = 0;
+        etapa = 3;
+      }
+    } else if (etapa == 3) {
+      if (opcion >= 0 && opcion < 7 && !abiertos[opcion]) {
+        abiertos[opcion] = true;
+        Serial.print("Maletín ");
+        Serial.print(opcion);
+        Serial.print(" abierto: $");
+        Serial.println(valores[opcion]);
+        descartados++;
+      }
+      if (descartados == 2) {
+        int suma = 0, cuenta = 0;
+        for (int i = 0; i < 7; i++) if (!abiertos[i]) { suma += valores[i]; cuenta++; }
+        oferta = (suma / cuenta) * 0.9;
+        Serial.print("Oferta del banco: $");
+        Serial.println(oferta);
+        Serial.println("¿Deal (1) o No Deal (0)?");
+        etapa = 4;
+      }
+    } else if (etapa == 4) {
+      if (opcion == 1) {
+        Serial.println("¡Aceptaste la oferta! Fin del juego.");
+        puntaje = oferta;
+        Serial.print("Tu puntaje es: ");
+        Serial.println(puntaje);
+Manda los datos a la función para insertar a la base de datos con el nombre del juego, el nombre del jugador, puntaje y el UID del tag NFC y reinicia el esp
+        if (insertDataToDatabase("DEAL OR NOT DEAL", usuario, puntaje, uidStr.c_str())) {
+    Serial.println("\n✓✓✓ Puntaje subido a la base de datos✓✓✓");
+  } else {
+    Serial.println("\n✗✗✗ ERROR EN INSERT ✗✗✗");
+  }
+  delay(5000);
+        ESP.restart();
+      } else {
+        Serial.print("No Deal. Tu maletín personal era: $");
+        Serial.println(valores[maletinPersonal]);
+        puntaje = valores[maletinPersonal];
+        Serial.print("Tu puntaje es: ");
+        Serial.println(puntaje);
+        Serial.println("Fin del juego.");
+Manda los datos a la función para insertar a la base de datos con el nombre del juego, el nombre del jugador, puntaje y el UID del tag NFC y reinicia el esp 
+if (insertDataToDatabase("DEAL OR NOT DEAL", usuario, puntaje, uidStr.c_str())) {
+    Serial.println("\n✓✓✓ Puntaje subido a la base de datos✓✓✓");
+  } else {
+    Serial.println("\n✗✗✗ ERROR EN INSERT ✗✗✗");
+  }
+  delay(5000);
+        ESP.restart();
+      }
+    }
+  }
+}
